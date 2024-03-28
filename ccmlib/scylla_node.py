@@ -47,6 +47,7 @@ class ScyllaNode(Node):
         self._node_install_dir = None
         self._node_scylla_version = None
         self._relative_repos_root = None
+        self._has_java_tools = None
         super().__init__(name, cluster, auto_bootstrap,
                          thrift_interface, storage_interface,
                          jmx_port, remote_debug_port,
@@ -97,6 +98,18 @@ class ScyllaNode(Node):
     @property
     def scylla_build_id(self):
         return self._run_scylla_executable_with_option(option="--build-id")
+
+    @property
+    def has_java(self):
+        if self._has_java_tools is None:
+            install_dir = self.node_install_dir
+            if self.is_scylla_reloc():
+                self._has_java_tools = os.path.isdir(os.path.join(install_dir, "jmx"))
+            else:
+                self._has_java_tools = os.path.isdir(os.path.join(install_dir, "tools", "jmx"))
+
+        return self._has_java_tools
+
 
     def scylla_mode(self):
         return self.cluster.get_scylla_mode()
@@ -688,14 +701,15 @@ class ScyllaNode(Node):
                                             wait_normal_token_owner=wait_normal_token_owner,
                                             wait_for_binary_proto=wait_for_binary_proto,
                                             ext_env=ext_env)
-        self._start_jmx(data)
+        if self.has_java:
+            self._start_jmx(data)
 
-        ip_addr, _ = self.network_interfaces['storage']
-        jmx_port = int(self.jmx_port)
-        if not self._wait_java_up(ip_addr, jmx_port):
-            e_msg = "Error starting node {}: unable to connect to scylla-jmx port {}:{}".format(
-                     self.name, ip_addr, jmx_port)
-            raise NodeError(e_msg, scylla_process)
+            ip_addr, _ = self.network_interfaces['storage']
+            jmx_port = int(self.jmx_port)
+            if not self._wait_java_up(ip_addr, jmx_port):
+                e_msg = "Error starting node {}: unable to connect to scylla-jmx port {}:{}".format(
+                         self.name, ip_addr, jmx_port)
+                raise NodeError(e_msg, scylla_process)
 
         self._update_pid(scylla_process)
         wait_for(func=lambda: self.is_running(), timeout=10, step=0.01)
@@ -809,7 +823,8 @@ class ScyllaNode(Node):
         """
 
         did_stop = False
-        self._update_jmx_pid(wait=False)
+        if self.has_java:
+            self._update_jmx_pid(wait=False)
         if self.scylla_manager and self.scylla_manager.is_agent_available:
             self._update_scylla_agent_pid()
         for proc in [self._process_jmx, self._process_scylla, self._process_agent]:
@@ -937,6 +952,8 @@ class ScyllaNode(Node):
 
     def copy_config_files(self):
         Node.copy_config_files(self)
+        if not self.has_java:
+            return
         conf_pattern = os.path.join(self.get_tools_java_dir(), 'conf', "jvm*.options")
         for filename in glob.glob(conf_pattern):
             if os.path.isfile(filename):
@@ -997,23 +1014,24 @@ class ScyllaNode(Node):
 
 
     def import_bin_files(self, exist_ok=False, replace=False):
-        # selectively copying files to reduce risk of using unintended items
-        self._copy_binaries(files=[CASSANDRA_SH, 'nodetool'],
-                            src_path=os.path.join(self.get_tools_java_dir(), BIN_DIR),
-                            dest_path=os.path.join(self.get_path(), 'resources', 'cassandra', BIN_DIR),
-                            exist_ok=exist_ok,
-                            replace=replace
-                            )
+        if self.has_java:
+            # selectively copying files to reduce risk of using unintended items
+            self._copy_binaries(files=[CASSANDRA_SH, 'nodetool'],
+                                src_path=os.path.join(self.get_tools_java_dir(), BIN_DIR),
+                                dest_path=os.path.join(self.get_path(), 'resources', 'cassandra', BIN_DIR),
+                                exist_ok=exist_ok,
+                                replace=replace
+                                )
 
-        # selectively copying files to reduce risk of using unintended items
-        # Copy sstable tools
-        self._copy_binaries(files=['sstabledump', 'sstablelevelreset', 'sstablemetadata',
-                                   'sstablerepairedset', 'sstablesplit'],
-                            src_path=os.path.join(self.get_tools_java_dir(), 'tools', BIN_DIR),
-                            dest_path=os.path.join(self.get_path(), 'resources', 'cassandra', 'tools', BIN_DIR),
-                            exist_ok=exist_ok,
-                            replace=replace
-                            )
+            # selectively copying files to reduce risk of using unintended items
+            # Copy sstable tools
+            self._copy_binaries(files=['sstabledump', 'sstablelevelreset', 'sstablemetadata',
+                                       'sstablerepairedset', 'sstablesplit'],
+                                src_path=os.path.join(self.get_tools_java_dir(), 'tools', BIN_DIR),
+                                dest_path=os.path.join(self.get_path(), 'resources', 'cassandra', 'tools', BIN_DIR),
+                                exist_ok=exist_ok,
+                                replace=replace
+                                )
 
         # TODO: - currently no scripts only executable - copying exec
         if self.is_scylla_reloc():
@@ -1022,6 +1040,11 @@ class ScyllaNode(Node):
                                    dst=os.path.join(self.get_bin_dir(), 'scylla'),
                                    extra_perms=stat.S_IEXEC,
                                    replace=replace)
+            if not self.has_java:
+                self.hard_link_or_copy(src=os.path.join(self.node_install_dir, BIN_DIR, 'nodetool'),
+                                       dst=os.path.join(self.get_bin_dir(), 'nodetool'),
+                                       extra_perms=stat.S_IEXEC,
+                                       replace=replace)
             os.environ['GNUTLS_SYSTEM_PRIORITY_FILE'] = self.gnutls_config_file
         else:
             self._relative_repos_root = '..'
@@ -1060,6 +1083,15 @@ class ScyllaNode(Node):
                         (returncode, stdout, stderr) = run_patchelf(patchelf_cmd)
                 if returncode != 0:
                     raise RuntimeError(f'{patchelf_cmd} exited with status {returncode}.\nstdout:{stdout}\nstderr:\n{stderr}')
+
+            if not self.has_java:
+                self.hard_link_or_copy(src=os.path.join(self.node_install_dir, 'bin', 'nodetool'),
+                                       dst=os.path.join(self.get_bin_dir(), 'nodetool'),
+                                       extra_perms=stat.S_IEXEC,
+                                       replace=replace)
+
+        if not self.has_java:
+            return
 
         if 'scylla-repository' in self.node_install_dir:
             self.hard_link_or_copy(os.path.join(self.get_jmx_dir(), 'scylla-jmx-1.0.jar'),
